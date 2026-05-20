@@ -31,13 +31,15 @@ class ProjectionHeads(nn.Module):
 
     def __init__(self, d_image: int, d_text: int, d_proj: int = 256) -> None:
         super().__init__()
-        # TODO: define self.image_proj, self.text_proj as nn.Linear(..., bias=False).
-        raise NotImplementedError
+        self.image_proj = nn.Linear(d_image, d_proj, bias=False)
+        self.text_proj = nn.Linear(d_text, d_proj, bias=False)
 
     def forward(
         self, image_embeds: torch.Tensor, text_embeds: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        raise NotImplementedError
+        image_proj = nn.functional.normalize(self.image_proj(image_embeds), dim=-1)
+        text_proj = nn.functional.normalize(self.text_proj(text_embeds), dim=-1)
+        return image_proj, text_proj
 
 
 def init_logit_scale() -> nn.Parameter:
@@ -70,5 +72,9 @@ def clip_loss(
     Returns:
         Scalar loss tensor.
     """
-    # TODO: implement.
-    raise NotImplementedError
+    scale = logit_scale.exp()
+    logits = image_embeds @ text_embeds.T * scale  # (B, B)
+    targets = torch.arange(logits.size(0), device=logits.device)
+    loss_i2t = torch.nn.functional.cross_entropy(logits, targets)
+    loss_t2i = torch.nn.functional.cross_entropy(logits.T, targets)
+    return 0.5 * (loss_i2t + loss_t2i)
