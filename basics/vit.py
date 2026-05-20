@@ -95,6 +95,61 @@ class RoPEHead(nn.Module):
         return attn @ v
 
 
+class RoPE2DHead(nn.Module):
+    """Drop-in replacement for basics.model.Head that applies 2D RoPE to q, k.
+
+    Patch positions are their 2D grid coordinates (row, col).  The CLS token is
+    assigned (row=0, col=0).  Coordinates are derived on-the-fly from the actual
+    sequence length, so this head works transparently at any image resolution
+    (length extrapolation requires only that RoPE2D was built with a large enough
+    grid_size).
+    """
+
+    def __init__(self, base_head: Head, rope2d: nn.Module) -> None:
+        super().__init__()
+        self.q_proj    = base_head.q_proj
+        self.k_proj    = base_head.k_proj
+        self.v_proj    = base_head.v_proj
+        self.dropout   = base_head.dropout
+        self.head_dim  = base_head.head_dim
+        self.is_decoder = base_head.is_decoder
+        if self.is_decoder:
+            self.register_buffer("tril", base_head.tril, persistent=False)
+        self.rope2d = rope2d
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        B, T, _ = x.shape
+        q = self.q_proj(x)   # (B, T, head_dim)
+        k = self.k_proj(x)
+        v = self.v_proj(x)
+
+        # Build (row, col) coordinates for every token.
+        # Sequence layout: [CLS, patch_0, patch_1, ..., patch_{N-1}]
+        # Patch i occupies grid cell (i // grid, i % grid).
+        n_patches = T - 1
+        grid = int(math.isqrt(n_patches))
+        patch_idx = torch.arange(n_patches, device=x.device)
+        row_coords = torch.cat([
+            torch.zeros(1, dtype=torch.long, device=x.device),
+            patch_idx // grid,
+        ])  # (T,)
+        col_coords = torch.cat([
+            torch.zeros(1, dtype=torch.long, device=x.device),
+            patch_idx % grid,
+        ])  # (T,)
+
+        # RoPE2D expects (B, num_heads, T, head_dim); here num_heads=1.
+        q = self.rope2d(q.unsqueeze(1), row_coords, col_coords).squeeze(1)
+        k = self.rope2d(k.unsqueeze(1), row_coords, col_coords).squeeze(1)
+
+        attn = (q @ k.transpose(-2, -1)) / math.sqrt(self.head_dim)
+        if self.is_decoder:
+            attn = attn.masked_fill(~self.tril[:T, :T], float("-inf"))
+        attn = F.softmax(attn, dim=-1)
+        attn = self.dropout(attn)
+        return attn @ v
+
+
 class ViT(nn.Module):
     """Vision Transformer.
 
@@ -102,15 +157,17 @@ class ViT(nn.Module):
       1. Patchify with `PatchEmbeddings`.
       2. Prepend a learnable [CLS] token.
       3a. (pe="learned") Add a learnable positional embedding (1, N+1, d_model).
-      3b. (pe="rope")    No additive PE; instead apply 1D RoPE to q and k inside
-                         every attention head (positions: CLS=0, patch_i=i+1).
+      3b. (pe="rope")    No additive PE; apply 1D RoPE to q, k inside every head
+                         (positions: CLS=0, patch_i=i+1).
+      3c. (pe="rope2d")  No additive PE; apply 2D RoPE to q, k using patch
+                         (row, col) grid coordinates (CLS maps to (0, 0)).
       4. Pass the sequence through `num_blocks` Transformer Blocks.
       5. Apply a final LayerNorm.
       6. Return the [CLS] slice — shape (B, d_model) — or all tokens.
 
     Args:
         img_size, patch_size, d_model, num_heads, num_blocks, dropout
-        pe: "learned" (default) | "rope"
+        pe: "learned" (default) | "rope" | "rope2d"
     """
 
     def __init__(
@@ -124,7 +181,7 @@ class ViT(nn.Module):
         pe: str = "learned",
     ) -> None:
         super().__init__()
-        assert pe in ("learned", "rope"), f"Unknown pe mode: {pe!r}"
+        assert pe in ("learned", "rope", "rope2d"), f"Unknown pe mode: {pe!r}"
         self.patch_embed = PatchEmbeddings(img_size, patch_size, d_model)
         self.num_patches = self.patch_embed.num_patches
         self.d_model = d_model
@@ -134,7 +191,7 @@ class ViT(nn.Module):
 
         if pe == "learned":
             self.pos_embed = nn.Parameter(torch.zeros(1, self.num_patches + 1, d_model))
-        # For pe="rope", no pos_embed parameter — positions are baked into heads.
+        # For pe="rope" / "rope2d", no pos_embed — positions live inside heads.
 
         block_size = self.num_patches + 1
         self.blocks = nn.ModuleList([
@@ -143,9 +200,14 @@ class ViT(nn.Module):
         ])
         self.norm = nn.LayerNorm(d_model)
 
+        head_dim = d_model // num_heads
         if pe == "rope":
-            head_dim = d_model // num_heads
             self._install_rope(head_dim)
+        elif pe == "rope2d":
+            assert head_dim % 4 == 0, (
+                f"head_dim={head_dim} must be divisible by 4 for 2D RoPE"
+            )
+            self._install_rope2d(head_dim)
 
     def _install_rope(self, head_dim: int) -> None:
         """Replace every Head in every Block with a RoPEHead."""
@@ -156,6 +218,17 @@ class ViT(nn.Module):
             heads = block.attn.heads
             for i in range(len(heads)):
                 heads[i] = RoPEHead(heads[i], rope)
+
+    def _install_rope2d(self, head_dim: int) -> None:
+        """Replace every Head in every Block with a RoPE2DHead."""
+        from basics.rope import RoPE2D
+        train_grid = int(math.isqrt(self.num_patches))
+        # Build with extra headroom so extrapolation to larger grids works.
+        rope2d = RoPE2D(head_dim, grid_size=max(train_grid * 2, 32))
+        for block in self.blocks:
+            heads = block.attn.heads
+            for i in range(len(heads)):
+                heads[i] = RoPE2DHead(heads[i], rope2d)
 
     def interpolate_pos_embed(self, new_num_patches: int) -> None:
         """Bilinearly interpolate the learned patch positional embeddings to a

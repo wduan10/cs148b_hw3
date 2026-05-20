@@ -26,9 +26,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--wandb", action="store_true", help="Log to W&B")
     p.add_argument(
         "--pe",
-        choices=["learned", "rope"],
+        choices=["learned", "rope", "rope2d"],
         default="learned",
-        help="Positional encoding: 'learned' (additive) or 'rope' (1D RoPE on q/k)",
+        help="Positional encoding: 'learned' (additive), 'rope' (1D RoPE on q/k), "
+             "or 'rope2d' (2D RoPE using patch grid coordinates)",
     )
     p.add_argument(
         "--extrapolate-img-size",
