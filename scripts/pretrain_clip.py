@@ -20,9 +20,21 @@ import yaml
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser()
     p.add_argument("--config", type=Path, required=True)
-    p.add_argument("--output-dir", type=Path, default=Path("runs/clip_eurosat"))
+    p.add_argument("--output-dir", type=Path, default=None)
     p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     p.add_argument("--wandb", action="store_true", help="Log to W&B")
+    p.add_argument(
+        "--pe",
+        choices=["learned", "rope"],
+        default="learned",
+        help="Positional encoding: 'learned' (additive) or 'rope' (1D RoPE on q/k)",
+    )
+    p.add_argument(
+        "--extrapolate-img-size",
+        type=int,
+        default=None,
+        help="If set, run length-extrapolation eval at this image size after training.",
+    )
     return p.parse_args()
 
 
@@ -41,6 +53,8 @@ def main() -> None:
     with open(args.config) as f:
         cfg = yaml.safe_load(f)
 
+    if args.output_dir is None:
+        args.output_dir = Path(f"runs/clip_eurosat_{args.pe}")
     args.output_dir.mkdir(parents=True, exist_ok=True)
     device = torch.device(args.device)
 
@@ -66,6 +80,7 @@ def main() -> None:
         num_heads=vit_cfg["num_heads"],
         num_blocks=vit_cfg["num_blocks"],
         dropout=vit_cfg["dropout"],
+        pe=args.pe,
     ).to(device)
 
     text_encoder = FrozenTextEncoder(cfg["text_encoder"]["model_name"])
@@ -187,6 +202,7 @@ def main() -> None:
                     "logit_scale": logit_scale.data,
                     "val_acc": val_acc,
                     "cfg": cfg,
+                    "pe": args.pe,
                 }
                 torch.save(ckpt, args.output_dir / "best.pt")
                 print(f"  → New best checkpoint saved (val_acc={val_acc:.4f})")
@@ -195,6 +211,49 @@ def main() -> None:
     if args.wandb:
         import wandb
         wandb.finish()
+
+    # ── Length-extrapolation evaluation ───────────────────────────────────────
+    if args.extrapolate_img_size is not None:
+        _run_extrapolation(args, cfg, vit, proj_heads, text_encoder, device)
+
+
+def _run_extrapolation(args, cfg, vit, proj_heads, text_encoder, device):
+    """Evaluate zero-shot accuracy at a larger image size (length extrapolation)."""
+    from vlm.data import EUROSAT_CLASSES, build_eurosat_loaders
+    from vlm.eval import zeroshot_classification_accuracy
+
+    eval_img_size = args.extrapolate_img_size
+    patch_size    = cfg["vit"]["patch_size"]
+    new_n_patches = (eval_img_size // patch_size) ** 2
+
+    print(f"\n── Length-extrapolation eval: {eval_img_size}×{eval_img_size} "
+          f"({new_n_patches} patches, trained on {vit.num_patches}) ──")
+
+    _, val_dl_extrap, _ = build_eurosat_loaders(
+        img_size=eval_img_size,
+        batch_size=cfg["train"]["batch_size"],
+        num_workers=cfg["train"]["num_workers"],
+    )
+
+    if args.pe == "learned":
+        # Bilinearly interpolate patch positional embeddings to the new grid.
+        vit.interpolate_pos_embed(new_n_patches)
+        print(f"  Interpolated pos_embed: {vit.num_patches} → {new_n_patches} patches")
+    else:
+        print("  RoPE: no interpolation needed — positions are computed on-the-fly")
+
+    class_prompts = [f"a satellite image of {c}" for c in EUROSAT_CLASSES]
+    extrap_acc = zeroshot_classification_accuracy(
+        vit=vit,
+        projection_heads=proj_heads,
+        text_encoder=text_encoder,
+        val_loader=val_dl_extrap,
+        class_prompts=class_prompts,
+        class_indices=list(range(len(EUROSAT_CLASSES))),
+        device=device,
+    )
+    print(f"  Extrapolation val_acc ({eval_img_size}×{eval_img_size}): {extrap_acc:.4f}")
+    return extrap_acc
 
 
 if __name__ == "__main__":

@@ -5,10 +5,13 @@ You implement: PatchEmbeddings, ViT.
 
 from __future__ import annotations
 
+import math
+
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
-from basics.model import Block
+from basics.model import Block, Head
 
 
 class PatchEmbeddings(nn.Module):
@@ -51,23 +54,63 @@ class PatchEmbeddings(nn.Module):
         return x
 
 
+class RoPEHead(nn.Module):
+    """Drop-in replacement for basics.model.Head that applies 1D RoPE to q, k.
+
+    Wraps an existing Head and re-implements forward, routing q/k through RoPE
+    before computing attention. Values are unaffected (RoPE is not applied to v).
+
+    Positions: CLS token → 0, patch i → i+1.
+    """
+
+    def __init__(self, base_head: Head, rope: nn.Module) -> None:
+        super().__init__()
+        # Delegate all projections and the dropout to the wrapped head.
+        self.q_proj   = base_head.q_proj
+        self.k_proj   = base_head.k_proj
+        self.v_proj   = base_head.v_proj
+        self.dropout  = base_head.dropout
+        self.head_dim = base_head.head_dim
+        self.is_decoder = base_head.is_decoder
+        if self.is_decoder:
+            self.register_buffer("tril", base_head.tril, persistent=False)
+        self.rope = rope
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        B, T, _ = x.shape
+        q = self.q_proj(x)   # (B, T, head_dim)
+        k = self.k_proj(x)
+        v = self.v_proj(x)
+
+        positions = torch.arange(T, device=x.device)
+        # RoPE expects (B, num_heads, T, head_dim); we have one head so num_heads=1.
+        q = self.rope(q.unsqueeze(1), positions).squeeze(1)
+        k = self.rope(k.unsqueeze(1), positions).squeeze(1)
+
+        attn = (q @ k.transpose(-2, -1)) / math.sqrt(self.head_dim)
+        if self.is_decoder:
+            attn = attn.masked_fill(~self.tril[:T, :T], float("-inf"))
+        attn = F.softmax(attn, dim=-1)
+        attn = self.dropout(attn)
+        return attn @ v
+
+
 class ViT(nn.Module):
     """Vision Transformer.
 
     Pipeline:
       1. Patchify with `PatchEmbeddings`.
       2. Prepend a learnable [CLS] token.
-      3. Add a learnable positional embedding of shape (1, num_patches+1, d_model).
-      4. Pass the sequence through `num_blocks` Transformer Blocks
-         (with is_decoder=False).
+      3a. (pe="learned") Add a learnable positional embedding (1, N+1, d_model).
+      3b. (pe="rope")    No additive PE; instead apply 1D RoPE to q and k inside
+                         every attention head (positions: CLS=0, patch_i=i+1).
+      4. Pass the sequence through `num_blocks` Transformer Blocks.
       5. Apply a final LayerNorm.
-      6. Return only the [CLS] slice — shape (B, d_model).
-
-    For §5 (VLM), you may want a `return_all_tokens=True` flag that returns the
-    full (B, num_patches+1, d_model) sequence instead. Add it when you get there.
+      6. Return the [CLS] slice — shape (B, d_model) — or all tokens.
 
     Args:
         img_size, patch_size, d_model, num_heads, num_blocks, dropout
+        pe: "learned" (default) | "rope"
     """
 
     def __init__(
@@ -78,14 +121,20 @@ class ViT(nn.Module):
         num_heads: int,
         num_blocks: int,
         dropout: float = 0.1,
+        pe: str = "learned",
     ) -> None:
         super().__init__()
+        assert pe in ("learned", "rope"), f"Unknown pe mode: {pe!r}"
         self.patch_embed = PatchEmbeddings(img_size, patch_size, d_model)
         self.num_patches = self.patch_embed.num_patches
         self.d_model = d_model
+        self.pe_mode = pe
 
         self.cls_token = nn.Parameter(torch.zeros(1, 1, d_model))
-        self.pos_embed = nn.Parameter(torch.zeros(1, self.num_patches + 1, d_model))
+
+        if pe == "learned":
+            self.pos_embed = nn.Parameter(torch.zeros(1, self.num_patches + 1, d_model))
+        # For pe="rope", no pos_embed parameter — positions are baked into heads.
 
         block_size = self.num_patches + 1
         self.blocks = nn.ModuleList([
@@ -94,6 +143,54 @@ class ViT(nn.Module):
         ])
         self.norm = nn.LayerNorm(d_model)
 
+        if pe == "rope":
+            head_dim = d_model // num_heads
+            self._install_rope(head_dim)
+
+    def _install_rope(self, head_dim: int) -> None:
+        """Replace every Head in every Block with a RoPEHead."""
+        from basics.rope import RoPE1D
+        # Use a large max_seq_len so RoPE works for extrapolation too.
+        rope = RoPE1D(head_dim, max_seq_len=1024)
+        for block in self.blocks:
+            heads = block.attn.heads
+            for i in range(len(heads)):
+                heads[i] = RoPEHead(heads[i], rope)
+
+    def interpolate_pos_embed(self, new_num_patches: int) -> None:
+        """Bilinearly interpolate the learned patch positional embeddings to a
+        new grid size, updating pos_embed in-place.
+
+        Used for the length-extrapolation evaluation (e.g. 64→144 patches).
+        The CLS embedding (index 0) is kept unchanged; only the N patch
+        embeddings are interpolated.
+
+        Args:
+            new_num_patches: Target number of patches (must be a perfect square).
+        """
+        assert self.pe_mode == "learned", "interpolate_pos_embed only applies to pe='learned'"
+        old_n = self.num_patches
+        new_n = new_num_patches
+        if old_n == new_n:
+            return
+
+        old_grid = int(math.isqrt(old_n))
+        new_grid = int(math.isqrt(new_n))
+        assert old_grid * old_grid == old_n, "old num_patches must be a perfect square"
+        assert new_grid * new_grid == new_n, "new num_patches must be a perfect square"
+
+        cls_pe    = self.pos_embed[:, :1, :]            # (1, 1, d_model)
+        patch_pe  = self.pos_embed[:, 1:, :]            # (1, old_n, d_model)
+
+        # Reshape to spatial grid and bilinearly upsample.
+        d = self.d_model
+        patch_pe  = patch_pe.reshape(1, old_grid, old_grid, d).permute(0, 3, 1, 2)
+        patch_pe  = F.interpolate(patch_pe, size=(new_grid, new_grid),
+                                  mode="bilinear", align_corners=False)
+        patch_pe  = patch_pe.permute(0, 2, 3, 1).reshape(1, new_n, d)
+
+        self.pos_embed = nn.Parameter(torch.cat([cls_pe, patch_pe], dim=1))
+
     def forward(self, x: torch.Tensor, return_all_tokens: bool = False) -> torch.Tensor:
         B = x.shape[0]
         # 1. patchify
@@ -101,8 +198,10 @@ class ViT(nn.Module):
         # 2. prepend CLS token
         cls = self.cls_token.expand(B, -1, -1)                # (B, 1, d_model)
         x = torch.cat([cls, x], dim=1)                        # (B, N+1, d_model)
-        # 3. add positional embedding
-        x = x + self.pos_embed                                # (B, N+1, d_model)
+        # 3. positional encoding
+        if self.pe_mode == "learned":
+            x = x + self.pos_embed                            # (B, N+1, d_model)
+        # for "rope": no additive PE; RoPE is applied inside each head
         # 4. transformer blocks
         for block in self.blocks:
             x = block(x)
