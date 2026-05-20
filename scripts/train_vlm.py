@@ -186,7 +186,7 @@ def main() -> None:
 
     dec_cfg  = cfg["decoder"]
     # For image_bidir masking with custom 4-D masks, eager attention is needed.
-    attn_impl = dec_cfg.get("attn_implementation", "flash_attention_2")
+    attn_impl = dec_cfg.get("attn_implementation", "sdpa")
     if args.mask_mode == "image_bidir":
         attn_impl = "eager"
 

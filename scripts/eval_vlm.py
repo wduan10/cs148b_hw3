@@ -60,7 +60,7 @@ def load_vlm_from_checkpoint(ckpt_path: Path, device: torch.device):
     if image_token_id is not None:
         tokenizer.add_special_tokens({"additional_special_tokens": ["<image>"]})
 
-    attn_impl = "eager" if mask_mode == "image_bidir" else "flash_attention_2"
+    attn_impl = "eager" if mask_mode == "image_bidir" else "sdpa"
     decoder = AutoModelForCausalLM.from_pretrained(
         dec_model_name,
         torch_dtype=torch_dtype,
