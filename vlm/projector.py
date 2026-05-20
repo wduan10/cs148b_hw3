@@ -27,9 +27,15 @@ class VisionLanguageProjector(nn.Module):
 
     def __init__(self, d_image: int, d_decoder: int, expansion: int = 4) -> None:
         super().__init__()
-        # TODO: implement.
-        raise NotImplementedError
+        hidden = expansion * d_image
+        self.net = nn.Sequential(
+            nn.Linear(d_image, hidden),
+            nn.GELU(),
+            nn.Linear(hidden, d_decoder),
+        )
 
     def forward(self, image_features: torch.Tensor) -> torch.Tensor:
-        # TODO: handle both (B, d_image) and (B, N, d_image) inputs.
-        raise NotImplementedError
+        # Normalize input to always be 3-D (B, N, d_image).
+        if image_features.dim() == 2:
+            image_features = image_features.unsqueeze(1)   # (B, 1, d_image)
+        return self.net(image_features)                    # (B, N, d_decoder)
