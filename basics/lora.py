@@ -5,6 +5,8 @@ You implement: LoRALinear, apply_lora_to_attention.
 
 from __future__ import annotations
 
+import math
+
 import torch
 import torch.nn as nn
 
@@ -35,14 +37,17 @@ class LoRALinear(nn.Module):
         self.scaling = alpha / rank
         self.base_layer = base_layer
 
-        # TODO: freeze base_layer's parameters.
-        # TODO: create self.A (nn.Parameter, shape (rank, d_in), kaiming-uniform init).
-        # TODO: create self.B (nn.Parameter, shape (d_out, rank), zero init).
-        raise NotImplementedError
+        for p in base_layer.parameters():
+            p.requires_grad_(False)
+
+        d_in  = base_layer.in_features
+        d_out = base_layer.out_features
+        self.A = nn.Parameter(torch.empty(rank, d_in))
+        self.B = nn.Parameter(torch.zeros(d_out, rank))
+        nn.init.kaiming_uniform_(self.A, a=math.sqrt(5))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # TODO: return base_layer(x) + scaling * (x @ A.T @ B.T)
-        raise NotImplementedError
+        return self.base_layer(x) + self.scaling * (x @ self.A.T @ self.B.T)
 
 
 def apply_lora_to_attention(model: nn.Module, rank: int, alpha: float) -> nn.Module:
@@ -61,7 +66,15 @@ def apply_lora_to_attention(model: nn.Module, rank: int, alpha: float) -> nn.Mod
                (e.g., a ViT).
         rank, alpha: Forwarded to LoRALinear.
     """
-    # TODO: implement.
-    # Hint: iterate model.named_modules(), check isinstance(m, Head), and
-    # set m.q_proj = LoRALinear(m.q_proj, rank, alpha) (and same for v_proj).
-    raise NotImplementedError
+    from basics.model import Head
+
+    # Freeze all existing parameters before adding LoRA adapters.
+    for p in model.parameters():
+        p.requires_grad_(False)
+
+    for m in model.modules():
+        if isinstance(m, Head):
+            m.q_proj = LoRALinear(m.q_proj, rank, alpha)
+            m.v_proj = LoRALinear(m.v_proj, rank, alpha)
+
+    return model
