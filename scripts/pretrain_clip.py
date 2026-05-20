@@ -81,7 +81,7 @@ def main() -> None:
         d_proj=d_proj,
     ).to(device)
 
-    logit_scale = init_logit_scale().to(device)
+    logit_scale = nn.Parameter(torch.tensor(math.log(1.0 / 0.07), device=device))
 
     # ── 4. Optimizer + scheduler ──────────────────────────────────────────────
     optim_cfg = cfg["optim"]
