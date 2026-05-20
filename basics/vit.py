@@ -8,6 +8,8 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 
+from basics.model import Block
+
 
 class PatchEmbeddings(nn.Module):
     """Split an image into non-overlapping patches and project each to d_model.
@@ -78,11 +80,35 @@ class ViT(nn.Module):
         dropout: float = 0.1,
     ) -> None:
         super().__init__()
-        # TODO: implement.
-        # Hint: store self.cls_token as nn.Parameter(torch.zeros(1, 1, d_model))
-        # and self.pos_embed as nn.Parameter(torch.zeros(1, num_patches+1, d_model)).
-        # Use basics.model.Block(..., is_decoder=False) for the encoder blocks.
-        raise NotImplementedError
+        self.patch_embed = PatchEmbeddings(img_size, patch_size, d_model)
+        self.num_patches = self.patch_embed.num_patches
+        self.d_model = d_model
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        raise NotImplementedError
+        self.cls_token = nn.Parameter(torch.zeros(1, 1, d_model))
+        self.pos_embed = nn.Parameter(torch.zeros(1, self.num_patches + 1, d_model))
+
+        block_size = self.num_patches + 1
+        self.blocks = nn.ModuleList([
+            Block(d_model, num_heads, block_size, is_decoder=False, dropout=dropout)
+            for _ in range(num_blocks)
+        ])
+        self.norm = nn.LayerNorm(d_model)
+
+    def forward(self, x: torch.Tensor, return_all_tokens: bool = False) -> torch.Tensor:
+        B = x.shape[0]
+        # 1. patchify
+        x = self.patch_embed(x)                               # (B, N, d_model)
+        # 2. prepend CLS token
+        cls = self.cls_token.expand(B, -1, -1)                # (B, 1, d_model)
+        x = torch.cat([cls, x], dim=1)                        # (B, N+1, d_model)
+        # 3. add positional embedding
+        x = x + self.pos_embed                                # (B, N+1, d_model)
+        # 4. transformer blocks
+        for block in self.blocks:
+            x = block(x)
+        # 5. final layer norm
+        x = self.norm(x)                                      # (B, N+1, d_model)
+        # 6. return CLS or all tokens
+        if return_all_tokens:
+            return x
+        return x[:, 0, :]                                     # (B, d_model)
